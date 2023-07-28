@@ -91,7 +91,8 @@ from typing import (
 from prometheus_client import Counter
 
 import synapse.metrics
-from synapse.api.constants import EduTypes, EventTypes, Membership, PresenceState
+from synapse.api.constants import EduTypes, EventTypes, Membership, PresenceState, \
+    AccountDataTypes
 from synapse.api.errors import SynapseError
 from synapse.api.presence import UserDevicePresenceState, UserPresenceState
 from synapse.appservice import ApplicationService
@@ -1553,16 +1554,13 @@ class PresenceHandler(BasePresenceHandler):
             if not event or event.content.get("membership") != Membership.JOIN:
                 # We only care about joins
                 continue
-
             if delta.prev_event_id:
                 prev_event = await self.store.get_event(
                     delta.prev_event_id, allow_none=True
                 )
-                if (
-                    prev_event
-                    and prev_event.content.get("membership") == Membership.JOIN
-                ):
+                if prev_event and (prev_event.content.get("membership") == Membership.JOIN or not prev_event.content.get("is_direct", False)):
                     # Ignore changes to join events.
+                    # Ignore non-direct room joins
                     continue
 
             newly_joined_users.add(delta.state_key)
@@ -1852,6 +1850,13 @@ class PresenceEventSource(EventSource[int, UserPresenceState]):
             # We'll actually pull the presence updates for these users at the end.
             interested_and_updated_users: StrCollection
 
+            user_account_data = await self.store.get_global_account_data_for_user(user_id)
+
+            # Copy direct message state if applicable
+            direct_rooms = user_account_data.get(AccountDataTypes.DIRECT, {})
+
+            # Check which key this room is under
+            sharing_users = set(direct_rooms.keys())
             if from_key is not None:
                 # First get all users that have had a presence update
                 result = stream_change_cache.get_all_entities_changed(from_key)
@@ -1864,10 +1869,6 @@ class PresenceEventSource(EventSource[int, UserPresenceState]):
                     # simply check which ones share a room with the user.
                     get_updates_counter.labels("stream").inc()
 
-                    sharing_users = await self.store.do_users_share_a_room(
-                        user_id, updated_users
-                    )
-
                     interested_and_updated_users = (
                         sharing_users.union(additional_users_interested_in)
                     ).intersection(updated_users)
@@ -1877,22 +1878,20 @@ class PresenceEventSource(EventSource[int, UserPresenceState]):
                     # if any of them have changed.
                     get_updates_counter.labels("full").inc()
 
-                    users_interested_in = (
-                        await self.store.get_users_who_share_room_with_user(user_id)
-                    )
-                    users_interested_in.update(additional_users_interested_in)
+                    # users_interested_in = (
+                    #     await self.store.get_users_who_share_room_with_user(user_id)
+                    # )
+                    sharing_users.update(additional_users_interested_in)
 
                     interested_and_updated_users = (
                         stream_change_cache.get_entities_changed(
-                            users_interested_in, from_key
+                            sharing_users, from_key
                         )
                     )
             else:
                 # No from_key has been specified. Return the presence for all users
                 # this user is interested in
-                interested_and_updated_users = (
-                    await self.store.get_users_who_share_room_with_user(user_id)
-                )
+                interested_and_updated_users = sharing_users
                 interested_and_updated_users.update(additional_users_interested_in)
 
             # Retrieve the current presence state for each user
@@ -2270,9 +2269,17 @@ async def get_interested_parties(
     room_ids_to_states: Dict[str, List[UserPresenceState]] = {}
     users_to_states: Dict[str, List[UserPresenceState]] = {}
     for state in states:
-        room_ids = await store.get_rooms_for_user(state.user_id)
-        for room_id in room_ids:
-            room_ids_to_states.setdefault(room_id, []).append(state)
+        # Retrieve user account data for predecessor room
+        user_account_data = await store.get_global_account_data_for_user(state.user_id)
+
+        # Copy direct message state if applicable
+        direct_rooms = user_account_data.get(AccountDataTypes.DIRECT, {})
+
+        # Check which key this room is under
+        if isinstance(direct_rooms, dict):
+            for user_id, room_id_list in direct_rooms.items():
+                for room_id in room_id_list:
+                    room_ids_to_states.setdefault(room_id, []).append(state)
 
         # Always notify self
         users_to_states.setdefault(state.user_id, []).append(state)
