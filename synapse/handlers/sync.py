@@ -1510,6 +1510,7 @@ class SyncHandler:
                 (
                     newly_joined_or_invited_or_knocked_users,
                     newly_left_users,
+                    newly_joined_direct_users
                 ) = sync_result_builder.calculate_user_changes()
 
                 if include_presence_data:
@@ -1517,7 +1518,7 @@ class SyncHandler:
                     await self._generate_sync_entry_for_presence(
                         sync_result_builder,
                         newly_joined_rooms,
-                        newly_joined_or_invited_or_knocked_users,
+                        newly_joined_direct_users,
                     )
 
                 if include_device_list_updates:
@@ -1799,7 +1800,7 @@ class SyncHandler:
         self,
         sync_result_builder: "SyncResultBuilder",
         newly_joined_rooms: AbstractSet[str],
-        newly_joined_or_invited_users: AbstractSet[str],
+        newly_joined_direct_users: AbstractSet[str],
     ) -> None:
         """Generates the presence portion of the sync response. Populates the
         `sync_result_builder` with the result.
@@ -1808,7 +1809,7 @@ class SyncHandler:
             sync_result_builder
             newly_joined_rooms: Set of rooms that the user has joined since
                 the last sync (or empty if an initial sync)
-            newly_joined_or_invited_users: Set of users that have joined or
+            newly_joined_direct_users: Set of users that have joined or
                 been invited to rooms since the last sync (or empty if an
                 initial sync)
         """
@@ -1836,10 +1837,20 @@ class SyncHandler:
             StreamKeyType.PRESENCE, presence_key
         )
 
-        extra_users_ids = set(newly_joined_or_invited_users)
+        extra_users_ids = set(newly_joined_direct_users)
         for room_id in newly_joined_rooms:
-            users = await self.store.get_users_in_room(room_id)
-            extra_users_ids.update(users)
+            # only send presence to direct rooms. Get the join event of ourselves
+            # and check if we were invited to a direct chat beforehand
+            membership, event_id =\
+                await self.store.get_local_current_membership_for_user_in_room(user.to_string(), room_id)
+            join_with_prev = await self.store.get_event(event_id, get_prev_content=True)
+            if join_with_prev:
+                prev_content = join_with_prev.unsigned.get("prev_content", {})
+                if not prev_content.get("is_direct", False):
+                    continue
+            else:
+                continue
+            extra_users_ids.update(await self.store.get_users_in_room(room_id))
         extra_users_ids.discard(user.to_string())
 
         if extra_users_ids:
@@ -2672,7 +2683,7 @@ class SyncResultBuilder:
     archived: List[ArchivedSyncResult] = attr.Factory(list)
     to_device: List[JsonDict] = attr.Factory(list)
 
-    def calculate_user_changes(self) -> Tuple[AbstractSet[str], AbstractSet[str]]:
+    def calculate_user_changes(self) -> Tuple[AbstractSet[str], AbstractSet[str], AbstractSet[str]]:
         """Work out which other users have joined or left rooms we are joined to.
 
         This data only is only useful for an incremental sync.
@@ -2681,6 +2692,7 @@ class SyncResultBuilder:
         """
         newly_joined_or_invited_or_knocked_users = set()
         newly_left_users = set()
+        newly_joined_direct_users = set()
         if self.since_token:
             for joined_sync in self.joined:
                 it = itertools.chain(
@@ -2688,6 +2700,8 @@ class SyncResultBuilder:
                 )
                 for event in it:
                     if event.type == EventTypes.Member:
+                        prev_content = event.unsigned.get("prev_content", {})
+                        prev_membership = prev_content.get("membership", None)
                         if (
                             event.membership == Membership.JOIN
                             or event.membership == Membership.INVITE
@@ -2696,14 +2710,15 @@ class SyncResultBuilder:
                             newly_joined_or_invited_or_knocked_users.add(
                                 event.state_key
                             )
+                            if event.membership == Membership.JOIN:
+                                if prev_content.get("is_direct", False):
+                                    newly_joined_direct_users.add(event.state_key)
                         else:
-                            prev_content = event.unsigned.get("prev_content", {})
-                            prev_membership = prev_content.get("membership", None)
                             if prev_membership == Membership.JOIN:
                                 newly_left_users.add(event.state_key)
 
         newly_left_users -= newly_joined_or_invited_or_knocked_users
-        return newly_joined_or_invited_or_knocked_users, newly_left_users
+        return newly_joined_or_invited_or_knocked_users, newly_left_users, newly_joined_direct_users
 
 
 @attr.s(slots=True, auto_attribs=True)

@@ -99,6 +99,16 @@ class EventStreamHandler:
                 if event.type == EventTypes.Member:
                     if event.membership != Membership.JOIN:
                         continue
+                    # ignore non-direct joined rooms
+                    replaces_event_id = event.unsigned.get("replaces_state", None)
+                    if replaces_event_id:
+                        replaced_event = await self.store.get_event(replaces_event_id)
+                        if not replaced_event or \
+                                replaced_event.membership != Membership.INVITE or \
+                                not replaced_event.content.get("is_direct", False):
+                            continue
+                    else:
+                        continue
                     # Send down presence.
                     if event.state_key == requester.user.to_string():
                         # Send down presence for everyone in the room.
